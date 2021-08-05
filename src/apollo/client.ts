@@ -9,15 +9,74 @@ import {
 } from "@apollo/client";
 import { onError } from "@apollo/client/link/error";
 import { setContext } from "@apollo/client/link/context";
-import fetch from "cross-fetch";
+import jwtDecode from "jwt-decode";
 import { TypedTypePolicies } from "./apollo-helpers";
 import { REFRESH_TOKEN } from "./mutations";
 import { RefreshTokenMutation, RefreshTokenMutationVariables } from "./types";
 import { storage } from "../core/storage";
 
+type JWTToken = {
+  iat: number;
+  iss: string;
+  owner: string;
+  exp: number;
+  token: string;
+  email: string;
+  type: string;
+  user_id: string;
+  is_staff: boolean;
+};
+
 let client: ApolloClient<NormalizedCacheObject> | undefined;
 
-export const authLink = setContext((_, { headers }) => {
+const refreshToken = async (
+  callback: (token: string) => void
+): Promise<void> => {
+  try {
+    const { data } = await client!.mutate<
+      RefreshTokenMutation,
+      RefreshTokenMutationVariables
+    >({
+      mutation: REFRESH_TOKEN,
+    });
+    if (data?.tokenRefresh?.token) {
+      storage.setToken(data.tokenRefresh.token);
+      callback(data?.tokenRefresh?.token);
+    }
+  } catch (error) {
+    storage.setToken("");
+    client!.resetStore();
+  }
+};
+
+const autoRefreshFetch = async (
+  input: RequestInfo,
+  init: RequestInit
+): Promise<Response> => {
+  const initialRequest = fetch(input, init);
+  const token = storage.getToken();
+
+  if (JSON.parse(`${init.body}`).operationName === "refreshToken") {
+    return await initialRequest;
+  }
+
+  if (token) {
+    // auto refresh token before 60 sec until it expires
+    const expirationTime = jwtDecode<JWTToken>(token).exp * 1000 - 60000;
+    if (Date.now() >= expirationTime) {
+      await refreshToken((token: string) => {
+        init.headers = {
+          ...init.headers,
+          authorization: `JWT ${token}`,
+        };
+      });
+    }
+  }
+
+  return await initialRequest;
+};
+
+const authLink = setContext((_, { headers }) => {
   const token = storage.getToken();
 
   return {
@@ -28,33 +87,24 @@ export const authLink = setContext((_, { headers }) => {
   };
 });
 
-export const errorLink = onError(
+const errorLink = onError(
   ({ graphQLErrors, networkError, operation, forward }) => {
     if (graphQLErrors) {
       const isUnAuthenticated = graphQLErrors.some(
         error => error.extensions && error.extensions.code === "UNAUTHENTICATED"
       );
 
-      if (client && isUnAuthenticated) {
+      if (isUnAuthenticated) {
         return fromPromise(
-          client
-            .mutate<RefreshTokenMutation, RefreshTokenMutationVariables>({
-              mutation: REFRESH_TOKEN,
-            })
-            .then(({ data }) => {
-              if (data?.tokenRefresh?.token) {
-                storage.setToken(data.tokenRefresh.token);
-                const oldHeaders = operation.getContext().headers;
-                operation.setContext({
-                  headers: {
-                    ...oldHeaders,
-                    authorization: `JWT ${data.tokenRefresh.token}`,
-                  },
-                });
-              } else if (client) {
-                client.resetStore();
-              }
-            })
+          refreshToken((token: string) => {
+            const oldHeaders = operation.getContext().headers;
+            operation.setContext({
+              headers: {
+                ...oldHeaders,
+                authorization: `JWT ${token}`,
+              },
+            });
+          })
         )
           .filter(Boolean)
           .flatMap(() => forward(operation));
@@ -77,8 +127,9 @@ export const errorLink = onError(
 
 const createLink = (uri: string): ApolloLink => {
   const httpLink = createHttpLink({
-    fetch,
+    fetch: autoRefreshFetch,
     uri,
+    credentials: "include",
   });
 
   return ApolloLink.from([errorLink, authLink, httpLink]);

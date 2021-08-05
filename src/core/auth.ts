@@ -149,6 +149,11 @@ export const auth = ({
       variables: { token },
     });
 
+    if (!result.data?.tokenVerify?.isValid) {
+      storage.setToken("");
+      console.log(storage.getToken());
+    }
+
     return result;
   };
 
